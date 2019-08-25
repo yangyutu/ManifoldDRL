@@ -8,6 +8,9 @@ import math
 import sys
 from abc import ABC
 from abc import abstractmethod
+from sklearn.neighbors import kneighbors_graph
+from scipy.sparse.csgraph import dijkstra
+import networkx as nx
 
 class ManifoldScheduler(ABC):
     def __init__(self, config, originTrainDataFile, lowDEmbeddingFile):
@@ -23,6 +26,13 @@ class ManifoldScheduler(ABC):
         dist = euclidean_distances([self.targetConfig], self.originTrainData)
         idx = np.argmin(dist)
         self.targetConfigEmbedding = self.lowDEmbedding[idx]
+        dist = euclidean_distances([self.startConfig], self.originTrainData)
+        idx = np.argmin(dist)
+        self.startConfigEmbedding = self.lowDEmbedding[idx]
+
+        distanctVec = self.startConfigEmbedding - self.targetConfigEmbedding
+        self.totalPathDistance = np.linalg.norm(distanctVec, ord=2)
+        print("start and target manifold distance", self.totalPathDistance)
 
         self.startThresh = 1
         self.endThresh = 1
@@ -43,7 +53,9 @@ class ManifoldScheduler(ABC):
         dist = euclidean_distances(state, self.lowDEmbedding)
         idx = np.argmin(dist)
         return self.originTrainData[idx]
-
+    def thresh_by_episode(self, step):
+        return self.endThresh + (
+                self.startThresh - self.endThresh) * math.exp(-1. * step / self.distanceThreshDecay)
 
 class ManifoldUniformScheduler(ManifoldScheduler):
     def __init__(self, config, originTrainData, lowDEmbedding):
@@ -51,7 +63,7 @@ class ManifoldUniformScheduler(ManifoldScheduler):
         self.methodName = 'ManifoldUniformScheduler'
 
     def getNextStartState(self, episodeIdx):
-        targetThresh = self.thresh_by_episode(episodeIdx) * 200
+        targetThresh = self.thresh_by_episode(episodeIdx) * self.totalPathDistance
         print('targetThresh', targetThresh)
         while True:
             state = np.random.randn(self.dim) * targetThresh + self.targetConfigEmbedding
@@ -60,40 +72,73 @@ class ManifoldUniformScheduler(ManifoldScheduler):
             if distance < targetThresh:
                 break
 
-        originalState = self.findClosest(state)
+        originalState = self.findClosest([state])
 
         return originalState
 
-    def findClosest(self, state):
 
-        dist = euclidean_distances([state], self.lowDEmbedding)
-        idx = np.argmin(dist)
-        return self.originTrainData[idx]
 
-    def thresh_by_episode(self, step):
-        return self.endThresh + (
-                self.startThresh - self.endThresh) * math.exp(-1. * step / self.distanceThreshDecay)
 
 class ManifoldDirectedScheduler(ManifoldScheduler):
     def __init__(self, config, originTrainData, lowDEmbedding):
         super(ManifoldDirectedScheduler, self).__init__(config, originTrainData, lowDEmbedding)
+        self.findPath()
+        self.variance = 9
 
     def getNextStartState(self, episodeIdx):
-        targetThresh = self.thresh_by_episode(episodeIdx) * 200
+        targetThresh = self.thresh_by_episode(episodeIdx) * self.totalPathDistance
+        print('targetThresh', targetThresh)
 
         while True:
-            state = np.random.randn(self.dim) * targetThresh + self.startConfig
-            distanctVec = state - self.startConfig
-            distance = np.linalg.norm(distanctVec, ord=np.inf)
+            maxIndexRange = min(i for i, x in enumerate(self.pathLength) if x > targetThresh)
+            idx = np.random.choice(range(maxIndexRange), 1)[0]
+            landmarkIdx = self.path[idx]
+            distance = self.pathLength[idx]
             if distance < targetThresh:
-                break
+                if idx > 0:
+                    landmark = self.lowDEmbedding[landmarkIdx]
+                    previousLandmark = self.lowDEmbedding[self.path[idx - 1]]
+                    directVector = np.array([landmark - previousLandmark])
+                    directVectorLength = np.linalg.norm(directVector, ord=2)
+                    directVector /= np.linalg.norm(directVector, ord=2)
+                    normalVector = np.array([[directVector[0, 1], -directVector[0, 0]]])
+                    ratio = distance / self.totalPathDistance
+                    scaledVariance = (ratio - ratio**2) * self.variance * 30
+                    covarainceMatrix = np.transpose(directVector).dot(directVector) * self.variance + \
+                                       np.transpose(normalVector).dot(normalVector) * scaledVariance
 
-        originalState = self.findClosest(state)
+                    candidateState = np.random.multivariate_normal([0, 0], covarainceMatrix) + landmark
 
-        return originalState
+                    originalState = self.findClosest([candidateState])
 
+                    return originalState
+                else:
+                    while True:
+                        state = np.random.randn(self.dim) * self.variance + self.targetConfigEmbedding
+                        distanctVec = state - self.targetConfigEmbedding
+                        distance = np.linalg.norm(distanctVec, ord=2)
+                        if distance < self.variance:
+                            break
+                    originalState = self.findClosest([state])
+                    return originalState
 
+    def findPath(self):
 
+        dist = euclidean_distances([self.targetConfig], self.originTrainData)
+        self.targetConfigIdx = np.argmin(dist)
+        dist = euclidean_distances([self.startConfig], self.originTrainData)
+        self.startConfigIdx = np.argmin(dist)
+        G = kneighbors_graph(self.lowDEmbedding, 10, mode='distance', include_self=False)
+
+        NX_G = nx.from_scipy_sparse_matrix(G)
+        self.path = nx.dijkstra_path(NX_G, self.targetConfigIdx, self.startConfigIdx)
+        pathLengthTotal = nx.dijkstra_path_length(NX_G, self.targetConfigIdx, self.startConfigIdx)
+        pathLengthAll = nx.single_source_dijkstra_path_length(NX_G, self.targetConfigIdx)
+
+        self.pathLength = [0.0]
+        for i in range(1, len(self.path)):
+            self.pathLength.append(pathLengthAll[self.path[i]])
+        #distMatrix, predecessors = dijkstra(G, directed=False, return_predecessors=True)
 
 class ManifoldNavigationEnv:
     def __init__(self, configName, randomSeed = 1):
